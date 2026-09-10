@@ -1,0 +1,15 @@
+[
+  {
+    "name": "J&J Egg Supply",
+    "description": "We are student entrepreneurs currently completing our On-the-Job Training (OJT), and J&J Egg Supply is the result of our dedication, teamwork, and entrepreneurial skills. We provide fresh, high-quality eggs to our customers.",
+    "owners": ["Juzlee G. Pabalan", "Jonard D. Lobo"],
+    "facebook_page": "https://www.facebook.com/profile.php?id=61591666550768",
+    "website": "none -- Facebook Page is the only official channel",
+    "operating_hours": "7:00 AM - 5:00 PM",
+    "hours_note": "We are open every day from 7:00 AM to 5:00 PM. That is our opening and closing time.",
+    "walk_ins_allowed": true,
+    "walk_in_note": "Walk-ins are welcome at the business address.",
+    "address": "INSERT REAL ADDRESS HERE -- redacted when provided to the dev team, must be filled in locally, not committed publicly if the client prefers privacy",
+    "last_updated": "2026-09-09"
+  }
+]

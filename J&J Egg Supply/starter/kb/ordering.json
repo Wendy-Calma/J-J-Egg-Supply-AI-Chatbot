@@ -1,0 +1,8 @@
+[
+  {
+    "ordering_channels": ["Facebook Page", "Messenger"],
+    "payment_methods": ["Cash", "GCash"],
+    "contact": "Messenger, or a personal contact number (INSERT REAL NUMBER HERE -- redacted when provided to the dev team)",
+    "last_updated": "2026-09-09"
+  }
+]

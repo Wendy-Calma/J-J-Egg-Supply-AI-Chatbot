@@ -1,0 +1,9 @@
+[
+  {
+    "note": "Per the client, most customer questions are about: pricing, whether there is a delivery fee, whether delivery is available to their area, and which sizes are currently in stock. Make sure the KB entries above (pricing.json, delivery.json, stock.json) stay current, since these cover the bulk of real customer questions."
+  },
+  {
+    "question": "Do you sell duck eggs?",
+    "answer_hint": "No verified info -- the chatbot should use the fallback response for this, not guess."
+  }
+]
