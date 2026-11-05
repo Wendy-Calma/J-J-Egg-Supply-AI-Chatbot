@@ -11,7 +11,7 @@ python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and paste in your real OPENAI_API_KEY
+# edit .env and paste in your real NVIDIA_API_KEY (from build.nvidia.com)
 python app.py
 ```
 

@@ -22,11 +22,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__, static_folder="static")
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client = OpenAI(
+    api_key=os.environ["NVIDIA_API_KEY"],
+    base_url="https://integrate.api.nvidia.com/v1",
+)
 
-# NOTE: verify this is still the correct model ID in the OpenAI dashboard
-# before your demo -- OpenAI occasionally renames or deprecates snapshots.
-MODEL = "gpt-5.6-luna"
+# NVIDIA NIM model id (build.nvidia.com) -- verify it's still available
+# before your demo, NVIDIA occasionally moves models between catalog tiers.
+MODEL = "meta/llama-3.2-11b-vision-instruct"
 
 FALLBACK = (
     "I don't have verified information about that yet. "
