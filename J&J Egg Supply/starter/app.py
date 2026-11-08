@@ -802,6 +802,12 @@ def home():
     return send_from_directory("static", "index.html")
 
 
+@app.route("/privacy")
+def privacy():
+    """Public privacy policy page (required by Meta to take the app Live)."""
+    return send_from_directory("static", "privacy.html")
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(force=True, silent=True) or {}
