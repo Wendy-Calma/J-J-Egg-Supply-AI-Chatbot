@@ -1,5 +1,5 @@
 [
   { "product": "Small Eggs (S)", "price": "\u20b1230.00", "unit": "per tray of 30 pcs", "size_range": "50-54 grams", "last_updated": "2026-09-09" },
-  { "product": "Medium Eggs (M)", "price": "\u20b1238.00", "unit": "per tray of 30 pcs", "size_range": "55-59 grams", "last_updated": "2026-11-05git " },
+  { "product": "Medium Eggs (M)", "price": "\u20b1238.00", "unit": "per tray of 30 pcs", "size_range": "55-59 grams", "last_updated": "2026-11-05" },
   { "product": "Large Eggs (L)", "price": "\u20b1255.00", "unit": "per tray of 30 pcs", "size_range": "60-65 grams", "last_updated": "2026-09-09" }
 ]

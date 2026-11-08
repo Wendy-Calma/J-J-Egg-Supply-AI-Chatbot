@@ -9,7 +9,7 @@
   #log { border: 1px solid #ddd; border-radius: 8px; height: 400px; overflow-y: auto; padding: 12px; background: white; }
   .msg { margin: 8px 0; padding: 8px 12px; border-radius: 10px; max-width: 80%; }
   .user { background: #6b5000; color: white; margin-left: auto; }
-  .bot { background: #f1e9d2; color: #333; }
+  .bot { background: #f1e9d2; color: #333; white-space: pre-line; }
   #row { display: flex; margin-top: 10px; }
   #input { flex: 1; padding: 8px; border-radius: 6px; border: 1px solid #ccc; }
   #send { padding: 8px 16px; margin-left: 8px; border: none; background: #6b5000; color: white; border-radius: 6px; cursor: pointer; }
@@ -27,6 +27,14 @@
 const log = document.getElementById('log');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
+
+// Random id per browser so the backend can keep this visitor's chat history.
+let sessionId = '';
+try { sessionId = localStorage.getItem('jj_session_id') || ''; } catch (e) {}
+if (!sessionId) {
+  sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9_-]/g, '');
+  try { localStorage.setItem('jj_session_id', sessionId); } catch (e) {}
+}
 
 function addMessage(text, who) {
   const div = document.createElement('div');
@@ -46,9 +54,10 @@ async function send() {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message })
+      body: JSON.stringify({ message, session_id: sessionId })
     });
     const data = await res.json();
+    if (data.session_id) sessionId = data.session_id;
     addMessage(data.reply, 'bot');
   } catch (err) {
     addMessage("Sorry, something went wrong reaching the server.", 'bot');
