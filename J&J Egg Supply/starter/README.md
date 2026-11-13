@@ -11,8 +11,7 @@ python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# install Ollama (ollama.com) and pull the model once:
-ollama pull qwen2.5:7b
+# put your Gemini API key (from aistudio.google.com) in .env as GEMINI_API_KEY
 python app.py
 ```
 
@@ -37,18 +36,18 @@ Open http://localhost:5000 in your browser to use the web chat.
 
 ## Editing the knowledge base
 
-Just edit the JSON files in `kb/`. No restart needed for the web chat during
-local development (files are re-read... actually note: currently the KB is
-loaded once at startup -- restart `python app.py` after editing KB files,
-or extend `load_knowledge_base()` to reload on each request if you want
-live updates without a restart).
+Edit the JSON files in `kb/`, then restart `python app.py` (the KB is loaded
+once at startup). Egg prices are better managed in the Google Sheet (below),
+which updates without a restart.
 
 ## How the bot works
 
-- The model runs locally in Ollama (`OLLAMA_URL`, `OLLAMA_MODEL` in `.env`).
-  Only the Flask backend talks to Ollama; the browser never does.
+- The model is Google Gemini (`GEMINI_API_KEY`, `GEMINI_MODEL` in `.env`),
+  called through its OpenAI-compatible API. Only the Flask backend talks to
+  Gemini; the API key never reaches the browser. Chat messages (including
+  customer names, addresses, and phone numbers in orders) are sent to Google.
 - `handle_message(session_id, text)` in `app.py` is the one chat function
-  (load prices -> build prompt -> call Ollama -> handle order). `/chat` and
+  (load prices -> build prompt -> call Gemini -> handle order). `/chat` and
   `/webhook` (Messenger) both call it.
 - The system prompt is rebuilt on every message from live prices, stock,
   delivery, payment, and store info, so the bot only uses current facts.
@@ -67,7 +66,7 @@ live updates without a restart).
 ## Updating egg prices (Google Sheet)
 
 Prices change often, so they can be managed in a Google Sheet instead of
-editing code or JSON. The bot re-reads the sheet at most every 5 minutes.
+editing code or JSON. The bot re-reads the sheet at most once a minute.
 
 One-time setup:
 
@@ -83,7 +82,8 @@ One-time setup:
 5. Restart the app once.
 
 After that, just edit the price in the sheet. The bot picks it up within about
-5 minutes (Google's publish delay plus the bot's cache), with no restart and
+5-6 minutes (mostly Google's publish delay, plus up to 1 minute of the bot's
+cache), with no restart and
 no git. If the sheet can't be reached, the bot falls back to `kb/pricing.json`,
 so update that file once in a while too.
 

@@ -6,66 +6,71 @@ One backend, two entry points:
   - GET/POST /webhook -> used by Facebook Messenger
 
 Both entry points call the exact same handle_message() function
-(load prices -> build prompt -> call Ollama -> handle order), so the
+(load prices -> build prompt -> call Gemini -> handle order), so the
 knowledge base, prompt rules, and order logic only exist in one place.
-Only this backend talks to Ollama; the browser never does.
+Only this backend talks to Gemini; the browser never sees the API key.
 """
 
 import os
 import re
 import io
+import sys
 import csv
 import json
 import glob
 import time
 import uuid
 import sqlite3
-import threading
 from datetime import datetime
 
 import requests
 from flask import Flask, request, jsonify, send_from_directory
+import openai
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Without this, printing "₱" on the Windows console crashes the request.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 app = Flask(__name__, static_folder="static")
 
-# Ollama runs locally and speaks the OpenAI API at /v1, so we keep the
-# OpenAI SDK and just point it at Ollama. The api_key is required by the
-# SDK but ignored by Ollama.
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
-OLLAMA_TIMEOUT_SECONDS = 120  # loading the model from disk can take a while
+# Gemini through its OpenAI-compatible endpoint, so we can use the OpenAI SDK.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Tried in order when the main model is busy, rate-limited, or too slow.
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in
+    os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-3.6-flash").split(",")
+    if m.strip() and m.strip() != GEMINI_MODEL
+]
+GEMINI_REASONING_EFFORT = os.environ.get("GEMINI_REASONING_EFFORT", "low")
+# A busy model can hang for a minute; give up early and try the next one.
+GEMINI_TIMEOUT_SECONDS = 20
 TEMPERATURE = 0.3
 
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY is not set in .env -- the chatbot cannot answer.")
+
 client = OpenAI(
-    api_key="ollama",
-    base_url=f"{OLLAMA_URL}/v1",
-    timeout=OLLAMA_TIMEOUT_SECONDS,
+    api_key=GEMINI_API_KEY or "missing",
+    base_url=GEMINI_BASE_URL,
+    timeout=GEMINI_TIMEOUT_SECONDS,
     max_retries=0,
 )
 
-
-
-def warm_up_ollama():
-    """Loads the model into memory at startup so the first customer
-    doesn't wait for it (runs in the background, errors are ignored)."""
-    try:
-        client.chat.completions.create(
-            model=OLLAMA_MODEL, max_tokens=1,
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        print(f"Ollama ready ({OLLAMA_MODEL})")
-    except Exception as e:
-        print("Ollama warm-up failed (is Ollama running?):", repr(e))
-
-
-threading.Thread(target=warm_up_ollama, daemon=True).start()
+# "Google is busy" errors: worth trying the next model (unlike a bad key).
+BUSY_ERRORS = (openai.APITimeoutError, openai.APIConnectionError,
+               openai.RateLimitError, openai.InternalServerError)
 
 DB_PATH = os.environ.get("DB_PATH", "jj_egg.db")
-HISTORY_LIMIT = 10        # only the last ~10 messages are sent to the model
+HISTORY_LIMIT = 10        # messages of history sent to the model
 BULK_ORDER_TRAYS = 12     # orders this big are referred to staff
 
 # ---------------------------------------------------------------------------
@@ -86,15 +91,11 @@ KB = load_knowledge_base()
 
 
 # ---------------------------------------------------------------------------
-# Live pricing from a published Google Sheet
+# Live pricing from a published Google Sheet (falls back to kb/pricing.json)
 # ---------------------------------------------------------------------------
-# Prices change often, so the owner edits them in a Google Sheet instead of
-# kb/pricing.json. Set PRICING_SHEET_CSV_URL to the sheet's "Publish to web"
-# CSV link. kb/pricing.json is still used as a fallback if the sheet is not
-# configured or can't be reached.
 
 PRICING_SHEET_CSV_URL = os.environ.get("PRICING_SHEET_CSV_URL", "").strip()
-PRICING_CACHE_SECONDS = 300  # re-check the sheet at most every 5 minutes
+PRICING_CACHE_SECONDS = 60  # re-check the sheet at most once a minute
 
 _pricing_cache = {"data": None, "checked_at": 0.0}
 
@@ -142,16 +143,14 @@ def get_pricing():
         return fallback
 
     now = time.time()
-    # Only hit the sheet once per PRICING_CACHE_SECONDS, even if it failed,
-    # so a broken sheet doesn't slow down every chat message.
+    # Checked at most once per cache period, even after a failure, so a
+    # broken sheet doesn't slow down every message.
     if now - _pricing_cache["checked_at"] >= PRICING_CACHE_SECONDS:
         _pricing_cache["checked_at"] = now
         live = fetch_live_pricing()
         if live:
             _pricing_cache["data"] = live
-    # If the sheet has never loaded (or is broken), use kb/pricing.json.
     return _pricing_cache["data"] or fallback
-
 
 
 def get_stock():
@@ -184,7 +183,7 @@ def store_name():
     return "J&J Egg Supply"
 
 
-def ollama_down_message():
+def ai_down_message():
     return (
         "Pasensya na po, may problema po ang aming system ngayon. "
         f"Pakitawagan o i-text po ang aming staff sa {staff_contact()}. Salamat po!\n"
@@ -254,10 +253,16 @@ def now_iso():
 
 def save_message(session_id, role, content):
     with db() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
             (session_id, role, content, now_iso()),
         )
+        return cur.lastrowid
+
+
+def delete_message(message_id):
+    with db() as conn:
+        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
 
 
 def recent_messages(session_id, limit=HISTORY_LIMIT):
@@ -658,7 +663,7 @@ def order_summary(record, language):
 
 
 # ---------------------------------------------------------------------------
-# Language detection (small models drift into Tagalog, so we remind them)
+# Language detection (tells the model which language to reply in)
 # ---------------------------------------------------------------------------
 
 TAGALOG_WORDS = {
@@ -673,7 +678,7 @@ ENGLISH_WORDS = {
     "the", "i", "i'm", "want", "do", "does", "you", "have", "how", "much", "is",
     "are", "my", "for", "please", "can", "what", "when", "where", "of", "and", "to",
     "would", "like", "it", "yes", "thanks", "thank", "your", "there", "any", "need",
-    "will", "much", "price", "deliver", "hi", "hello",
+    "will", "price", "deliver", "hi", "hello",
 }
 LANGUAGE_HINTS = {
     "english": "English only (no Tagalog words, no \"po\").",
@@ -716,21 +721,32 @@ def order_problem(reason):
 # The one reusable chat function (web chat and Messenger both call this)
 # ---------------------------------------------------------------------------
 
-CJK_CHARS = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯]")
-
-
-def call_ollama(messages):
+def ask_gemini(model, messages):
     response = client.chat.completions.create(
-        model=OLLAMA_MODEL,
+        model=model,
         temperature=TEMPERATURE,
         messages=messages,
+        # extra_body so it works with the pinned openai==1.51.0 SDK
+        extra_body={"reasoning_effort": GEMINI_REASONING_EFFORT},
     )
     return (response.choices[0].message.content or "").strip()
 
 
+def call_model(messages):
+    """Asks the main model; if Google says it's busy, tries each fallback model."""
+    models = [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS
+    for i, model in enumerate(models):
+        try:
+            return ask_gemini(model, messages)
+        except BUSY_ERRORS as e:
+            if i == len(models) - 1:
+                raise
+            print(f"{model} busy ({type(e).__name__}), trying {models[i + 1]}")
+
+
 def handle_message(session_id, text):
-    """load prices -> build prompt -> call Ollama -> handle order -> reply text."""
-    save_message(session_id, "user", text)
+    """load prices -> build prompt -> call Gemini -> handle order -> reply text."""
+    user_message_id = save_message(session_id, "user", text)
 
     system_prompt = build_system_prompt()
     language = reply_language(session_id)
@@ -739,22 +755,15 @@ def handle_message(session_id, text):
     messages = [{"role": "system", "content": system_prompt}] + recent_messages(session_id)
 
     try:
-        raw_reply = call_ollama(messages)
-        if CJK_CHARS.search(raw_reply):
-            # Qwen sometimes slips into Chinese: retry once with a reminder.
-            print("Non-Filipino/English reply, retrying:", raw_reply)
-            reminder = {"role": "system", "content":
-                        "Reply ONLY in English, Tagalog, or Taglish. Never use Chinese."}
-            raw_reply = call_ollama(messages + [reminder])
-            if CJK_CHARS.search(raw_reply):
-                raw_reply = unsure_message()
-    except Exception as e:  # Ollama down, timeout, model missing, etc.
-        print("Ollama error:", repr(e))
-        return ollama_down_message()
+        raw_reply = call_model(messages)
+    except Exception as e:  # Gemini down, bad API key, quota, etc.
+        print("Gemini error:", repr(e))
+        # Unanswered messages left in the history confuse the next reply.
+        delete_message(user_message_id)
+        return ai_down_message()
 
     reply, order, had_tag = extract_order(raw_reply)
 
-    # Check the order the model wrote, using backend prices and rules.
     record, error = None, None
     if order is not None:
         record, error = validate_and_price(order)
@@ -769,7 +778,6 @@ def handle_message(session_id, text):
         reply = ""
 
     if had_tag and is_confirmation(text):
-        # Customer confirmed: save the order with the backend's total.
         if error:
             reply = (reply + "\n\n" + order_problem(error)).strip()
         else:
@@ -784,7 +792,7 @@ def handle_message(session_id, text):
             print("Ignored [ORDER] line before customer confirmation:", order)
         if not reply and record and not error:
             # Model's summary was empty or had wrong math: show the backend's.
-            reply = order_summary(record, reply_language(session_id))
+            reply = order_summary(record, language)
 
     if not reply:
         reply = unsure_message()
@@ -806,7 +814,6 @@ def home():
 def chat():
     data = request.get_json(force=True, silent=True) or {}
     question = str(data.get("message", "")).strip()
-    # The browser keeps a random session id so each visitor has their own history.
     session_id = re.sub(r"[^A-Za-z0-9_-]", "", str(data.get("session_id", "")))[:64]
     session_id = session_id or uuid.uuid4().hex
 
@@ -817,7 +824,7 @@ def chat():
         answer = handle_message("web:" + session_id, question)
     except Exception as e:  # NFR-07: fail safely, never crash the chat
         print("Chat error:", repr(e))
-        answer = ollama_down_message()
+        answer = ai_down_message()
 
     return jsonify({"reply": answer, "session_id": session_id})
 
@@ -853,7 +860,7 @@ def receive_message():
                     answer = handle_message(f"messenger:{sender_id}", message["text"])
                 except Exception as e:
                     print("Messenger error:", repr(e))
-                    answer = ollama_down_message()
+                    answer = ai_down_message()
                 send_message(sender_id, answer)
 
     return "ok", 200
@@ -868,4 +875,7 @@ def send_message(recipient_id, text):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    # FLASK_DEBUG=1 in .env: auto-reload on code changes. Off by default because
+    # the debug page would be reachable by anyone on the same network.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
+            debug=os.environ.get("FLASK_DEBUG") == "1")

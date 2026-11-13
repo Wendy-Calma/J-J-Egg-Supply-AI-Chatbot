@@ -28,13 +28,9 @@ const log = document.getElementById('log');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 
-// Random id per browser so the backend can keep this visitor's chat history.
-let sessionId = '';
-try { sessionId = localStorage.getItem('jj_session_id') || ''; } catch (e) {}
-if (!sessionId) {
-  sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9_-]/g, '');
-  try { localStorage.setItem('jj_session_id', sessionId); } catch (e) {}
-}
+// New random id on every page load, so a refresh starts a fresh conversation
+// (the page starts empty, so the bot's memory should too).
+let sessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9_-]/g, '');
 
 function addMessage(text, who) {
   const div = document.createElement('div');
