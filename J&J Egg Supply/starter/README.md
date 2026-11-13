@@ -11,7 +11,7 @@ python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and paste in your real NVIDIA_API_KEY (from build.nvidia.com)
+# put your Gemini API key (from aistudio.google.com) in .env as GEMINI_API_KEY
 python app.py
 ```
 
@@ -36,11 +36,56 @@ Open http://localhost:5000 in your browser to use the web chat.
 
 ## Editing the knowledge base
 
-Just edit the JSON files in `kb/`. No restart needed for the web chat during
-local development (files are re-read... actually note: currently the KB is
-loaded once at startup -- restart `python app.py` after editing KB files,
-or extend `load_knowledge_base()` to reload on each request if you want
-live updates without a restart).
+Edit the JSON files in `kb/`, then restart `python app.py` (the KB is loaded
+once at startup). Egg prices are better managed in the Google Sheet (below),
+which updates without a restart.
+
+## How the bot works
+
+- The model is Google Gemini (`GEMINI_API_KEY`, `GEMINI_MODEL` in `.env`),
+  called through its OpenAI-compatible API. Only the Flask backend talks to
+  Gemini; the API key never reaches the browser. Chat messages (including
+  customer names, addresses, and phone numbers in orders) are sent to Google.
+- `handle_message(session_id, text)` in `app.py` is the one chat function
+  (load prices -> build prompt -> call Gemini -> handle order). `/chat` and
+  `/webhook` (Messenger) both call it.
+- The system prompt is rebuilt on every message from live prices, stock,
+  delivery, payment, and store info, so the bot only uses current facts.
+- Chat history and orders are saved in SQLite (`jj_egg.db`). Only the last
+  10 messages of a conversation are sent to the model.
+- When a customer confirms an order, the model writes a hidden `[ORDER] {...}`
+  line. The backend removes it, re-checks size, stock, delivery rules, and
+  payment, recalculates the total from its own prices (never the model's
+  math), saves it to the `orders` table, and shows the customer the
+  confirmed total.
+- To see orders: `sqlite3 jj_egg.db "SELECT * FROM orders ORDER BY id DESC;"`
+  (or open the file with DB Browser for SQLite).
+- `kb/promotions.json` is not shown to the bot: discounts, bulk orders (12+
+  trays), price negotiation, and complaints are always referred to staff.
+
+## Updating egg prices (Google Sheet)
+
+Prices change often, so they can be managed in a Google Sheet instead of
+editing code or JSON. The bot re-reads the sheet at most once a minute.
+
+One-time setup:
+
+1. Create a Google Sheet with this header row (first row):
+   `product | price | unit | size_range | last_updated`
+2. Add one row per egg size, e.g.
+   `Medium Eggs (M) | 238 | per tray of 30 pcs | 55-59 grams | 2026-11-05`
+   (price can be `238`, `238.00` or `₱238`).
+3. File -> Share -> **Publish to web** -> pick that sheet -> **Comma-separated
+   values (.csv)** -> Publish, and copy the link.
+4. Put the link in `.env` (and in your host's environment variables):
+   `PRICING_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/e/.../pub?output=csv`
+5. Restart the app once.
+
+After that, just edit the price in the sheet. The bot picks it up within about
+5-6 minutes (mostly Google's publish delay, plus up to 1 minute of the bot's
+cache), with no restart and
+no git. If the sheet can't be reached, the bot falls back to `kb/pricing.json`,
+so update that file once in a while too.
 
 ## Before you run this
 
