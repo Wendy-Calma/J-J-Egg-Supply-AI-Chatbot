@@ -71,7 +71,7 @@ BUSY_ERRORS = (openai.APITimeoutError, openai.APIConnectionError,
 
 DB_PATH = os.environ.get("DB_PATH", "jj_egg.db")
 HISTORY_LIMIT = 10        # messages of history sent to the model
-BULK_ORDER_TRAYS = 12     # orders this big are referred to staff
+MAX_MESSAGE_CHARS = 1000  # longer customer messages are cut (protects the Gemini quota)
 
 # ---------------------------------------------------------------------------
 # Knowledge base loading (FR-01 to FR-03, section 6 of the SRS)
@@ -91,11 +91,18 @@ KB = load_knowledge_base()
 
 
 # ---------------------------------------------------------------------------
-# Live pricing from a published Google Sheet (falls back to kb/pricing.json)
+# Products, prices, and stock from a published Google Sheet
 # ---------------------------------------------------------------------------
 
 PRICING_SHEET_CSV_URL = os.environ.get("PRICING_SHEET_CSV_URL", "").strip()
+# Optional Apps Script web app inside the sheet (see sheet_script.gs): reads the
+# sheet live and subtracts stock when an order is saved.
+SHEET_SCRIPT_URL = os.environ.get("SHEET_SCRIPT_URL", "").strip()
+SHEET_SCRIPT_SECRET = os.environ.get("SHEET_SCRIPT_SECRET", "").strip()
 PRICING_CACHE_SECONDS = 60  # re-check the sheet at most once a minute
+
+if not PRICING_SHEET_CSV_URL and not SHEET_SCRIPT_URL:
+    print("WARNING: PRICING_SHEET_CSV_URL is not set in .env -- the bot has no prices or stock.")
 
 _pricing_cache = {"data": None, "checked_at": 0.0}
 
@@ -105,22 +112,33 @@ def _format_price(raw):
     Returns None if the value isn't a number."""
     cleaned = re.sub(r"[^\d.]", "", raw or "")
     try:
-        return f"₱{float(cleaned):.2f}"
+        return f"₱{float(cleaned):,.2f}"
     except ValueError:
         return None
 
 
-def fetch_live_pricing():
-    """Downloads the pricing sheet as CSV. Returns a list of entries shaped
-    like kb/pricing.json, or None if anything goes wrong."""
-    try:
-        resp = requests.get(PRICING_SHEET_CSV_URL, timeout=5)
+def fetch_sheet_rows():
+    """The sheet as a list of rows (first row = headers): live from the Apps
+    Script if configured, else from the published CSV."""
+    if SHEET_SCRIPT_URL:
+        resp = requests.get(SHEET_SCRIPT_URL, timeout=10)
         resp.raise_for_status()
-        resp.encoding = "utf-8"
-        rows = csv.DictReader(io.StringIO(resp.text))
+        return resp.json()["rows"]
+    resp = requests.get(PRICING_SHEET_CSV_URL, timeout=5)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    return list(csv.reader(io.StringIO(resp.text)))
+
+
+def fetch_live_pricing():
+    """Downloads the sheet. Returns a list of
+    {product, price, unit, size_range, stock} entries, or None on any error."""
+    try:
+        rows = fetch_sheet_rows()
+        headers = [str(h).strip().lower() for h in rows[0]]
         entries = []
-        for row in rows:
-            row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        for values in rows[1:]:
+            row = {h: str(v).strip() for h, v in zip(headers, values)}
             product = row.get("product")
             price = _format_price(row.get("price"))
             if not product or not price:
@@ -129,6 +147,9 @@ def fetch_live_pricing():
             for field in ("unit", "size_range", "last_updated"):
                 if row.get(field):
                     entry[field] = row[field]
+            # Empty cell (or no stock column) = not counted; 0 = out of stock.
+            count = re.search(r"\d+", row.get("stock", ""))
+            entry["stock"] = int(count.group(0)) if count else None
             entries.append(entry)
         return entries or None
     except Exception as e:
@@ -137,10 +158,10 @@ def fetch_live_pricing():
 
 
 def get_pricing():
-    """Current prices: from the Google Sheet (cached), else kb/pricing.json."""
-    fallback = KB.get("pricing", [])
-    if not PRICING_SHEET_CSV_URL:
-        return fallback
+    """Current products and prices from the Google Sheet (cached). If the sheet
+    can't be reached, the last copy that loaded is kept."""
+    if not PRICING_SHEET_CSV_URL and not SHEET_SCRIPT_URL:
+        return []
 
     now = time.time()
     # Checked at most once per cache period, even after a failure, so a
@@ -150,11 +171,33 @@ def get_pricing():
         live = fetch_live_pricing()
         if live:
             _pricing_cache["data"] = live
-    return _pricing_cache["data"] or fallback
+    return _pricing_cache["data"] or []
+
+
+def take_stock(items):
+    """Subtracts ordered quantities from the sheet's stock column via the
+    Apps Script. Returns an error message if the sheet refused (e.g. not
+    enough left), else None. Does nothing if no script is configured."""
+    if not SHEET_SCRIPT_URL:
+        return None
+    payload = {"secret": SHEET_SCRIPT_SECRET,
+               "items": [{"product": i["product"], "quantity": i["quantity"]} for i in items]}
+    try:
+        resp = requests.post(SHEET_SCRIPT_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        # Save the order anyway; staff can fix the count by hand.
+        print("Stock update failed (order still saved, update the sheet by hand):", repr(e))
+        return None
+    _pricing_cache["checked_at"] = 0  # re-read the new stock on the next message
+    return result.get("error")
 
 
 def get_stock():
-    return KB.get("stock", [])
+    """Stock from the sheet's "stock" column (trays for eggs, sacks for rice)."""
+    return [{"product": p["product"], "stock": p.get("stock"), "unit": unit_name(p) + "s"}
+            for p in get_pricing()]
 
 
 def staff_contact():
@@ -213,6 +256,13 @@ def db():
 
 def init_db():
     with db() as conn:
+        # Older databases had one product per order (product/trays columns).
+        if "product" in [r[1] for r in conn.execute("PRAGMA table_info(orders)")]:
+            conn.execute("ALTER TABLE orders RENAME TO orders_old")
+        old_layout = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders_old'"
+        ).fetchone() is not None
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,12 +277,11 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                product TEXT NOT NULL,
-                trays INTEGER NOT NULL,
-                unit_price REAL NOT NULL,
+                items_summary TEXT NOT NULL,
                 fulfillment TEXT NOT NULL,
                 delivery_area TEXT,
                 delivery_fee REAL NOT NULL,
+                discount REAL NOT NULL DEFAULT 0,
                 total REAL NOT NULL,
                 customer_name TEXT NOT NULL,
                 contact TEXT NOT NULL,
@@ -241,7 +290,45 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'new',
                 raw_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pending_orders (
+                session_id TEXT PRIMARY KEY,
+                raw_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL REFERENCES orders(id),
+                product TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit TEXT NOT NULL,
+                unit_price REAL NOT NULL,
+                line_total REAL NOT NULL
+            );
         """)
+
+        if "discount" not in [r[1] for r in conn.execute("PRAGMA table_info(orders)")]:
+            conn.execute("ALTER TABLE orders ADD COLUMN discount REAL NOT NULL DEFAULT 0")
+
+        if old_layout:
+            for r in conn.execute("SELECT * FROM orders_old").fetchall():
+                conn.execute(
+                    """INSERT INTO orders (id, session_id, created_at, items_summary, fulfillment,
+                       delivery_area, delivery_fee, total, customer_name, contact, address,
+                       payment_method, status, raw_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (r["id"], r["session_id"], r["created_at"], f"{r['trays']} tray(s) {r['product']}",
+                     r["fulfillment"], r["delivery_area"], r["delivery_fee"], r["total"],
+                     r["customer_name"], r["contact"], r["address"], r["payment_method"],
+                     r["status"], r["raw_json"]),
+                )
+                conn.execute(
+                    "INSERT INTO order_items (order_id, product, quantity, unit, unit_price, line_total) "
+                    "VALUES (?, ?, ?, 'tray', ?, ?)",
+                    (r["id"], r["product"], r["trays"], r["unit_price"], r["unit_price"] * r["trays"]),
+                )
+            conn.execute("DROP TABLE orders_old")
 
 
 init_db()
@@ -284,23 +371,37 @@ def peso_to_float(text):
 
 
 def find_product(name):
-    """Matches 'Medium', 'm', 'Medium Eggs (M)', 'medium eggs' to a pricing entry."""
+    """Matches 'Medium', 'm', 'Medium Eggs (M)', 'jasmine rice' to a pricing entry."""
     wanted = (name or "").strip().lower()
     if not wanted:
         return None
-    for entry in get_pricing():
+    pricing = get_pricing()
+    for entry in pricing:
         product = entry["product"].lower()
         letter = re.search(r"\((\w+)\)", product)
         first_word = product.split()[0]
         if wanted in (product, first_word, f"{first_word} eggs") or (letter and wanted == letter.group(1)):
             return entry
-    return None
+    # Every word given appears in exactly one product name ("jasmine rice").
+    words = set(re.findall(r"\w+", wanted))
+    matches = [e for e in pricing if words <= set(re.findall(r"\w+", e["product"].lower()))]
+    return matches[0] if len(matches) == 1 else None
+
+
+def unit_name(product_entry):
+    """'sack' or 'tray', from the price list's unit (e.g. 'per sack')."""
+    return "sack" if "sack" in product_entry.get("unit", "").lower() else "tray"
+
+
+def count_units(quantity, unit):
+    return f"{quantity} {unit}{'' if quantity == 1 else 's'}"
 
 
 def stock_for(product_name):
+    """Units in stock, or None if the product's stock isn't counted."""
     for entry in get_stock():
         if entry.get("product", "").lower() == product_name.lower():
-            return entry.get("stock_trays")
+            return entry.get("stock")
     return None
 
 
@@ -320,6 +421,14 @@ def delivery_rule(area):
 
 def money(amount):
     return f"₱{amount:,.2f}"
+
+
+def egg_discount_rule():
+    """(minimum egg trays, peso discount) from kb/promotions.json, or (None, 0)."""
+    for promo in KB.get("promotions", []):
+        if promo.get("min_egg_trays") and promo.get("discount"):
+            return int(promo["min_egg_trays"]), float(promo["discount"])
+    return None, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -343,15 +452,20 @@ def _describe(entry):
 def build_facts():
     lines = []
 
-    lines.append("PRICES (per tray of 30 pcs):")
+    lines.append("PRICES:")
+    if not get_pricing():
+        lines.append("- Prices and stock are unavailable right now. Give the staff contact number.")
     for p in get_pricing():
         size = f" ({p['size_range']})" if p.get("size_range") else ""
         lines.append(f"- {p['product']}{size}: {p['price']} {p.get('unit', '')}".rstrip())
 
-    lines.append("\nSTOCK (trays available now):")
+    lines.append("\nSTOCK (available now):")
     for s in get_stock():
-        trays = s.get("stock_trays", 0)
-        status = "OUT OF STOCK" if not trays else f"{trays} trays"
+        count = s.get("stock")
+        if count is None:
+            status = "not counted (our staff will confirm availability)"
+        else:
+            status = "OUT OF STOCK" if not count else f"{count} {s.get('unit', 'trays')}"
         lines.append(f"- {s['product']}: {status}")
 
     lines.append("\nDELIVERY:")
@@ -372,8 +486,9 @@ def build_facts():
     for p in KB.get("policies", []):
         lines.append(f"- {_describe(p)}")
 
-    # kb/promotions.json is intentionally NOT included: discounts are handled
-    # by staff only, so the bot never promises one.
+    lines.append("\nPROMOS (applied to the order total automatically):")
+    for p in KB.get("promotions", []):
+        lines.append(f"- {p.get('details', '')}")
 
     return "\n".join(lines)
 
@@ -382,12 +497,21 @@ def build_examples():
     """Few-shot examples built from live data so they never show stale prices."""
     examples = []
     pricing = get_pricing()
-    if pricing:
-        p = pricing[-1]
+    trays = [p for p in pricing if unit_name(p) == "tray"]
+    sacks = [p for p in pricing if unit_name(p) == "sack"]
+    if trays:
+        p = trays[-1]
         examples.append(
             f"Customer: Magkano po ang isang tray ng {p['product'].split()[0]}?\n"
-            f"Assistant: Ang {p['product']} po ay {p['price']} per tray of 30 pcs. "
+            f"Assistant: Ang {p['product']} po ay {p['price']} {p.get('unit', 'per tray')}. "
             "Ilang tray po ang kailangan ninyo?"
+        )
+    if sacks:
+        p = sacks[0]
+        examples.append(
+            f"Customer: Magkano po ang isang sako ng {p['product']}?\n"
+            f"Assistant: Ang {p['product']} po ay {p['price']} {p.get('unit', 'per sack')}. "
+            "Ilang sako po ang kailangan ninyo?"
         )
     outside = next((d for d in KB.get("delivery", []) if d.get("coverage", "").lower().startswith("outside")), None)
     if outside:
@@ -402,34 +526,44 @@ def build_examples():
         examples.append(
             "Customer: Pa-deliver po sana. Paano po magbayad?\n"
             f"Assistant: Pwede po kayong magbayad sa {' o '.join(methods)}. "
-            "Ano pong size at ilang tray ang order ninyo?"
+            "Ano po ang order ninyo at ilan po?"
+        )
+    min_trays, discount = egg_discount_rule()
+    if min_trays:
+        examples.append(
+            "Customer: May discount po ba kung marami ang order?\n"
+            f"Assistant: Opo! May {money(discount)} discount po ang buong order kapag "
+            f"{min_trays} trays o higit pa ng itlog (kahit iba-ibang size). "
+            "Ilang tray po ang order ninyo?"
         )
     examples.append(
-        "Customer: May discount po ba kung 20 trays?\n"
-        "Assistant: Para po sa bulk orders at discounts, ang aming staff po ang tutulong sa inyo. "
-        f"Pakitawagan o i-text po sila sa {staff_contact()}. Salamat po!"
+        "Customer: Pwede po bang tawaran, ₱200 na lang per tray?\n"
+        "Assistant: Pasensya na po, hindi ko po mababago ang presyo. Para po sa ganitong request, "
+        f"pakitawagan o i-text po ang aming staff sa {staff_contact()}. Salamat po!"
     )
     examples.append(
         "Customer: What's the weather today?\n"
-        f"Assistant: Sorry, I can only help with questions about {store_name()}'s eggs, "
-        "prices, delivery, and orders. Is there anything about our eggs I can help you with?"
+        f"Assistant: Sorry, I can only help with questions about {store_name()}'s eggs and rice, "
+        "prices, delivery, and orders. Is there anything I can help you with?"
     )
     return "\n\n".join(examples)
 
 
-SYSTEM_PROMPT = """You are the customer service assistant of {store}, a small egg supply store. \
-You help customers with egg prices, stock, delivery, payment, and taking orders.
+SYSTEM_PROMPT = """You are the customer service assistant of {store}, a small store selling eggs (by the tray) \
+and rice (by the sack). You help customers with prices, stock, delivery, payment, and taking orders.
 
 LANGUAGE
 - Look at the customer's LATEST message and reply in that language: English -> English only. Tagalog -> Tagalog. Taglish (mixed) -> Taglish.
 - In Tagalog or Taglish, be polite and use "po" and "opo".
-- Never translate egg size names. Write them exactly as listed (e.g. "Medium Eggs (M)").
+- Never translate product names. Write them exactly as listed (e.g. "Medium Eggs (M)", "Jasmine Denorado Rice").
 - Always write prices with the ₱ sign (e.g. ₱238.00).
 
 TAGALOG WORDS CUSTOMERS USE
 - itlog = egg
 - tray / bandehado = one tray of 30 eggs
 - kaha = case/box (ask how many trays they mean)
+- bigas = rice
+- sako = sack
 - magkano = how much
 - meron pa ba = is there still any / is it in stock
 - pa-deliver = please deliver
@@ -439,19 +573,27 @@ FACTS (the ONLY information you may use)
 
 RULES
 1. Use ONLY the facts above. Never invent prices, discounts, stock, fees, delivery schedules, or any other detail. If the answer is not in the facts, say you are not sure and give the staff contact number {contact}.
-2. If a size is OUT OF STOCK, say so and suggest a size that is in stock. Never accept more trays than are in stock.
-3. Never promise, deny, or apply discounts. If the customer asks about a discount or promo, wants {bulk} trays or more, tries to negotiate the price, or has a complaint (broken or rotten eggs, late or wrong delivery, refunds), do not decide it yourself: say our staff will help and give the number {contact}.
-4. Only talk about the store and its eggs. Politely redirect unrelated questions.
+2. If a product is OUT OF STOCK, say so and suggest one that is in stock. Never accept more than is in stock. If a product's stock is "not counted", you may take the order but say our staff will confirm availability.
+3. You may tell customers about the PROMOS above; the system applies them to the order total automatically. Never promise or invent any other discount. If the customer asks for a different discount, tries to negotiate the price, or has a complaint (broken or rotten eggs, late or wrong delivery, refunds), do not decide it yourself: say our staff will help and give the number {contact}.
+4. Only talk about the store and its products. Politely redirect unrelated questions.
 5. Keep replies short: 1 to 4 sentences.
-6. For delivery, ask whether the address is within Angeles City, then tell the customer that area's delivery fee and minimum order (if any) before continuing. Do not accept a delivery order below the minimum.
+6. For delivery, ask whether the address is within Angeles City, then tell the customer that area's delivery fee and minimum order (if any) before continuing. Do not accept a delivery order below the minimum. Follow the DELIVERY facts for rice.
 
 TAKING AN ORDER
-Collect these details, asking for only one or two at a time:
-egg size, number of trays, delivery or pickup, customer name, contact number, delivery address (delivery only; ask whether it is within Angeles City), payment method.
-Then show an order summary with the total (price per tray x trays, plus the delivery fee if delivery) and ask the customer to confirm.
-Only AFTER you have shown the summary AND the customer clearly confirms it (e.g. "yes", "opo", "confirm"), end your reply with this line, on its own line, as valid JSON, filled in ONLY with details the customer actually gave you:
-[ORDER] {{"size": "<exact size name>", "trays": <number>, "fulfillment": "<delivery or pickup>", "delivery_area": "<within_angeles or outside_angeles, null for pickup>", "name": "<customer's name>", "contact": "<customer's number>", "address": "<delivery address, empty for pickup>", "payment": "<payment method>"}}
-Never write the [ORDER] line before the customer confirms, never write it twice for the same order, and never mention it to the customer.
+One order can have several products (e.g. eggs and rice together). Collect these details, asking for only one or two at a time:
+each product and its quantity (trays for eggs, sacks for rice), delivery or pickup, customer name, contact number, delivery address (delivery only; ask whether it is within Angeles City), payment method.
+When you have ALL the details, do NOT calculate the total yourself. Write one short sentence (e.g. "Narito po ang inyong order:") and end your reply with this line, on its own line, as valid JSON, filled in ONLY with details the customer actually gave you:
+[ORDER] {{"items": [{{"product": "<exact product name>", "quantity": <number>}}], "fulfillment": "<delivery or pickup>", "delivery_area": "<within_angeles or outside_angeles, null for pickup>", "name": "<customer's name>", "contact": "<customer's number>", "address": "<delivery address, empty for pickup>", "payment": "<payment method>"}}
+The system then shows the customer the order summary with the correct total and asks them to confirm.
+- If the customer confirms (e.g. "yes", "opo", "confirm"), thank them and write the same [ORDER] line again.
+- If they change something, write the updated [ORDER] line.
+List every product in "items". Never mention the [ORDER] line to the customer.
+After the customer confirms, the order still has to be confirmed by our staff. Never say the order is confirmed, final, or ready; say our staff will confirm it and contact them on Messenger or by phone. If the customer asks about their order's status, say it is waiting for staff confirmation and give the staff number {contact}.
+
+AFTER AN ORDER IS RECEIVED (a message starting with "⏳ ... Order #")
+- That order is closed. Never change it, add to it, or repeat its items. Do not offer to "add to your order".
+- If the customer wants more products, that is a NEW, separate order: its [ORDER] line lists ONLY the new products. Reuse the name, contact number, delivery details, and payment method they already gave (ask only if they want to change them).
+- To change or cancel an order that was already received, give the staff number {contact}.
 
 EXAMPLES
 {examples}
@@ -463,7 +605,6 @@ def build_system_prompt():
         store=store_name(),
         facts=build_facts(),
         contact=staff_contact(),
-        bulk=BULK_ORDER_TRAYS,
         examples=build_examples(),
     )
 
@@ -478,19 +619,20 @@ def _peso_amounts(text):
 
 def looks_ungrounded(answer, facts, user_message=""):
     """True if the answer mentions a ₱ amount that is neither in the facts /
-    the customer's message nor a valid order amount (price x trays,
-    fee x trays, or (price + fee) x trays)."""
+    the customer's message nor a single order line (price x quantity,
+    fee x trays, or (price + fee) x trays). Order totals are written by the
+    backend (order_summary), not the model."""
     amounts = _peso_amounts(answer)
     if not amounts:
         return False
     known = _peso_amounts(facts) + _peso_amounts(user_message)
     prices = [peso_to_float(p["price"]) for p in get_pricing()]
     fees = [f for f in (delivery_rule("within_angeles")[0], delivery_rule("outside_angeles")[0]) if f]
-    # (unit amount, max trays). Fee-only totals are small, so they get a
-    # tight cap; otherwise a ₱5 fee would make any multiple of 5 "valid".
-    max_trays = max([BULK_ORDER_TRAYS] + [s.get("stock_trays") or 0 for s in get_stock()])
-    units = [(u, max_trays) for u in prices + [p + f for p in prices for f in fees] if u]
-    units += [(f, BULK_ORDER_TRAYS) for f in fees]
+    # (unit amount, max quantity). Fee-only lines get a tight cap; otherwise
+    # a ₱5 fee would make any multiple of 5 "valid".
+    max_qty = max([20] + [s.get("stock") or 0 for s in get_stock()])
+    units = [(u, max_qty) for u in prices + [p + f for p in prices for f in fees] if u]
+    units += [(f, 20) for f in fees]
 
     def ok(amount):
         if any(abs(amount - k) < 0.01 for k in known):
@@ -548,24 +690,47 @@ def details_came_from_customer(order, session_id):
             and bool(name_words) and name_words[0] in said.lower())
 
 
+def order_lines(order):
+    """The [ORDER] line's items; also accepts the old one-product format."""
+    items = order.get("items")
+    if items is None and order.get("size"):
+        items = [{"product": order.get("size"), "quantity": order.get("trays")}]
+    return items if isinstance(items, list) else []
+
+
 def validate_and_price(order):
     """Recalculates the total from backend prices. Returns (record, error)."""
-    product = find_product(str(order.get("size", "")))
-    if not product:
-        return None, "unknown egg size"
-    unit_price = peso_to_float(product["price"])
+    items = {}
+    for line in order_lines(order):
+        if not isinstance(line, dict):
+            return None, "invalid order items"
+        product = find_product(str(line.get("product", "")))
+        if not product:
+            return None, f"unknown product: {line.get('product')}"
+        try:
+            quantity = int(line.get("quantity"))
+        except (TypeError, ValueError):
+            return None, "invalid quantity"
+        if quantity < 1:
+            return None, "invalid quantity"
+        name = product["product"]
+        if name in items:
+            items[name]["quantity"] += quantity
+        else:
+            items[name] = {"product": name, "quantity": quantity, "unit": unit_name(product),
+                           "unit_price": peso_to_float(product["price"])}
+    if not items:
+        return None, "no products in the order"
 
-    try:
-        trays = int(order.get("trays"))
-    except (TypeError, ValueError):
-        return None, "invalid number of trays"
-    if trays < 1:
-        return None, "invalid number of trays"
-    if trays >= BULK_ORDER_TRAYS:
-        return None, f"bulk orders ({BULK_ORDER_TRAYS}+ trays) are handled by our staff"
-    stock = stock_for(product["product"])
-    if stock is not None and trays > stock:
-        return None, f"only {stock} trays of {product['product']} are in stock"
+    items = list(items.values())
+    for item in items:
+        stock = stock_for(item["product"])
+        if stock is not None and item["quantity"] > stock:
+            return None, f"only {count_units(stock, item['unit'])} of {item['product']} in stock"
+        item["line_total"] = item["unit_price"] * item["quantity"]
+
+    egg_trays = sum(i["quantity"] for i in items if i["unit"] == "tray")
+    has_sacks = any(i["unit"] == "sack" for i in items)
 
     fulfillment = str(order.get("fulfillment", "")).strip().lower()
     if fulfillment not in ("delivery", "pickup"):
@@ -590,21 +755,26 @@ def validate_and_price(order):
             return None, "unknown delivery area"
         if not address:
             return None, "missing delivery address"
+        if delivery_area == "outside_angeles" and has_sacks:
+            return None, "rice delivery outside Angeles City is arranged by our staff"
         fee_per_tray, minimum = delivery_rule(delivery_area)
         if fee_per_tray is None:
             return None, "delivery is not available for that area"
-        if trays < minimum:
-            return None, f"delivery to that area needs at least {minimum} trays"
-        fee_total = fee_per_tray * trays
+        if minimum > 1 and egg_trays < minimum:
+            return None, f"delivery to that area needs at least {minimum} trays of eggs"
+        fee_total = fee_per_tray * egg_trays
+
+    min_trays, discount = egg_discount_rule()
+    if not (min_trays and egg_trays >= min_trays):
+        discount = 0.0
 
     record = {
-        "product": product["product"],
-        "trays": trays,
-        "unit_price": unit_price,
+        "items": items,
         "fulfillment": fulfillment,
         "delivery_area": delivery_area,
         "delivery_fee": fee_total,
-        "total": unit_price * trays + fee_total,
+        "discount": discount,
+        "total": sum(i["line_total"] for i in items) + fee_total - discount,
         "customer_name": name,
         "contact": contact,
         "address": address,
@@ -613,53 +783,120 @@ def validate_and_price(order):
     return record, None
 
 
-def save_order(session_id, record, raw_order):
+def describe_items(items):
+    """'5 trays Small Eggs (S) x ₱230.00 = ₱1,150.00; 1 sack ...'"""
+    return "; ".join(
+        f"{count_units(i['quantity'], i['unit'])} {i['product']} x {money(i['unit_price'])} "
+        f"= {money(i['line_total'])}"
+        for i in items
+    )
+
+
+def recent_order_id(session_id, record):
+    """Id of the same order saved in the last 30 minutes, if any (the model
+    sometimes repeats the [ORDER] line after the order is saved)."""
     with db() as conn:
-        # Guard against the model repeating the same [ORDER] line.
-        dup = conn.execute(
-            "SELECT id FROM orders WHERE session_id = ? AND product = ? AND trays = ? "
+        row = conn.execute(
+            "SELECT id FROM orders WHERE session_id = ? AND items_summary = ? "
             "AND contact = ? AND created_at >= ?",
-            (session_id, record["product"], record["trays"], record["contact"],
+            (session_id, describe_items(record["items"]), record["contact"],
              datetime.fromtimestamp(time.time() - 1800).isoformat(timespec="seconds")),
         ).fetchone()
-        if dup:
-            return dup["id"], False
-        cur = conn.execute(
-            """INSERT INTO orders (session_id, created_at, product, trays, unit_price,
-               fulfillment, delivery_area, delivery_fee, total, customer_name, contact,
-               address, payment_method, raw_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, now_iso(), record["product"], record["trays"], record["unit_price"],
-             record["fulfillment"], record["delivery_area"], record["delivery_fee"],
-             record["total"], record["customer_name"], record["contact"], record["address"],
-             record["payment_method"], json.dumps(raw_order, ensure_ascii=False)),
+    return row["id"] if row else None
+
+
+def set_pending_order(session_id, order):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_orders (session_id, raw_json, updated_at) VALUES (?, ?, ?)",
+            (session_id, json.dumps(order, ensure_ascii=False), now_iso()),
         )
-        return cur.lastrowid, True
 
 
-def order_confirmation(order_id, record):
-    fee = f" + delivery fee {money(record['delivery_fee'])}" if record["delivery_fee"] else ""
+def get_pending_order(session_id):
+    with db() as conn:
+        row = conn.execute("SELECT raw_json FROM pending_orders WHERE session_id = ?",
+                           (session_id,)).fetchone()
+    return json.loads(row["raw_json"]) if row else None
+
+
+SUMMARY_MARKER = "Order summary"
+
+
+def last_bot_message(session_id):
+    return next((m["content"] for m in reversed(recent_messages(session_id))
+                 if m["role"] == "assistant"), "")
+
+
+def summary_was_shown(session_id, record):
+    """True if the bot's previous message was the summary of this exact order."""
+    last = last_bot_message(session_id)
+    return describe_items(record["items"]) in last and money(record["total"]) in last
+
+
+def save_order(session_id, record, raw_order):
+    summary = describe_items(record["items"])
+    with db() as conn:
+        conn.execute("DELETE FROM pending_orders WHERE session_id = ?", (session_id,))
+        cur = conn.execute(
+            """INSERT INTO orders (session_id, created_at, items_summary, fulfillment,
+               delivery_area, delivery_fee, discount, total, customer_name, contact, address,
+               payment_method, raw_json, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+            (session_id, now_iso(), summary, record["fulfillment"], record["delivery_area"],
+             record["delivery_fee"], record["discount"], record["total"], record["customer_name"],
+             record["contact"], record["address"], record["payment_method"],
+             json.dumps(raw_order, ensure_ascii=False)),
+        )
+        order_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO order_items (order_id, product, quantity, unit, unit_price, line_total) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(order_id, i["product"], i["quantity"], i["unit"], i["unit_price"], i["line_total"])
+             for i in record["items"]],
+        )
+        return order_id
+
+
+def fees_and_discount(record):
+    """' + delivery fee ₱30.00 - discount ₱50.00' (empty parts left out)."""
+    text = f" + delivery fee {money(record['delivery_fee'])}" if record["delivery_fee"] else ""
+    if record.get("discount"):
+        text += f" - discount {money(record['discount'])}"
+    return text
+
+
+def order_received(order_id, record, language):
+    """Shown after the customer confirms: the order now waits for staff."""
+    details = (
+        f"{describe_items(record['items'])}{fees_and_discount(record)}. "
+        f"Total: {money(record['total'])}, {record['fulfillment']}, {record['payment_method']}."
+    )
+    if language == "english":
+        return (
+            f"⏳ Order #{order_id} received and waiting for staff confirmation: {details} "
+            f"Your order is not final yet. Please wait for our staff to confirm it; "
+            f"they will contact you on Messenger or at {record['contact']}. Thank you!"
+        )
     return (
-        f"✅ Order #{order_id} recorded: {record['trays']} tray(s) {record['product']} "
-        f"({money(record['unit_price'])} each{fee}). Total: {money(record['total'])}, "
-        f"{record['fulfillment']}, {record['payment_method']}. "
-        f"Our staff will contact you at {record['contact']} to confirm. Salamat po!"
+        f"⏳ Natanggap na po ang Order #{order_id} at hinihintay na lang po ang kumpirmasyon "
+        f"ng aming staff: {details} Hindi pa po final ang order. Pakihintay po ang "
+        f"kumpirmasyon ng aming staff; kokontakin po nila kayo sa Messenger o sa "
+        f"{record['contact']}. Salamat po!"
     )
 
 
 def order_summary(record, language):
-    """Backend-computed summary, used when the model's own summary was wrong."""
-    subtotal = record["unit_price"] * record["trays"]
-    fee = f" + delivery fee {money(record['delivery_fee'])}" if record["delivery_fee"] else ""
+    """Order summary with the backend's total, shown before the customer confirms."""
     where = f"delivery to {record['address']}" if record["fulfillment"] == "delivery" else "pickup"
     details = (
-        f"{record['trays']} tray(s) {record['product']} x {money(record['unit_price'])} = "
-        f"{money(subtotal)}{fee}. Total: {money(record['total'])} ({where}, "
+        f"{describe_items(record['items'])}{fees_and_discount(record)}. "
+        f"Total: {money(record['total'])} ({where}, "
         f"{record['payment_method']}). {record['customer_name']}, {record['contact']}."
     )
     if language == "english":
-        return f"Order summary: {details} Reply \"yes\" to confirm."
-    return f"Order summary po: {details} Paki-reply po ng \"opo\" para i-confirm."
+        return f"{SUMMARY_MARKER}: {details} Reply \"yes\" to confirm."
+    return f"{SUMMARY_MARKER} po: {details} Paki-reply po ng \"opo\" para i-confirm."
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +909,7 @@ TAGALOG_WORDS = {
     "salamat", "itlog", "lang", "naman", "yung", "sana", "pwede", "puwede", "paano",
     "saan", "ilan", "ilang", "oo", "hindi", "din", "rin", "kasi", "gusto", "bili",
     "bibili", "pa-deliver", "padeliver", "pa-order", "isang", "dalawa", "tatlo",
-    "bandehado", "kaha", "sige", "tig", "ano", "kailan", "pakidala",
+    "bandehado", "kaha", "sige", "tig", "ano", "kailan", "pakidala", "bigas", "sako",
 }
 ENGLISH_WORDS = {
     "the", "i", "i'm", "want", "do", "does", "you", "have", "how", "much", "is",
@@ -711,8 +948,8 @@ def reply_language(session_id):
 
 def order_problem(reason):
     return (
-        f"Pasensya na po, hindi ko po ma-save ang order ({reason}). "
-        f"Sorry, I couldn't save the order ({reason}). "
+        f"Pasensya na po, may problema po sa order ({reason}). "
+        f"Sorry, there's a problem with the order ({reason}). "
         f"You can also contact our staff at {staff_contact()}."
     )
 
@@ -746,6 +983,7 @@ def call_model(messages):
 
 def handle_message(session_id, text):
     """load prices -> build prompt -> call Gemini -> handle order -> reply text."""
+    text = text[:MAX_MESSAGE_CHARS]
     user_message_id = save_message(session_id, "user", text)
 
     system_prompt = build_system_prompt()
@@ -763,6 +1001,11 @@ def handle_message(session_id, text):
         return ai_down_message()
 
     reply, order, had_tag = extract_order(raw_reply)
+    if (order is None and not had_tag and is_confirmation(text) and len(text.split()) <= 4
+            and SUMMARY_MARKER in last_bot_message(session_id)):
+        # A short "yes" right after the summary, but the model didn't repeat
+        # the [ORDER] line: use the order waiting for confirmation.
+        order = get_pending_order(session_id)
 
     record, error = None, None
     if order is not None:
@@ -772,27 +1015,28 @@ def handle_message(session_id, text):
     elif had_tag:
         error = "the order details were incomplete"
 
-    ungrounded = looks_ungrounded(reply, system_prompt, text)
-    if ungrounded:
+    if looks_ungrounded(reply, system_prompt, text):
         print("Ungrounded reply replaced:", reply)
         reply = ""
 
-    if had_tag and is_confirmation(text):
-        if error:
-            reply = (reply + "\n\n" + order_problem(error)).strip()
+    if error:
+        reply = (reply + "\n\n" + order_problem(error)).strip()
+    elif record:
+        if recent_order_id(session_id, record):
+            pass  # already saved; the model just repeated the [ORDER] line
+        elif is_confirmation(text) and summary_was_shown(session_id, record):
+            stock_error = take_stock(record["items"])
+            if stock_error:  # someone else bought the last ones in the meantime
+                reply = (reply + "\n\n" + order_problem(stock_error)).strip()
+            else:
+                order_id = save_order(session_id, record, order)
+                print(f"New order #{order_id} (waiting for staff): {record}")
+                reply = (reply + "\n\n" + order_received(order_id, record, language)).strip()
         else:
-            order_id, is_new = save_order(session_id, record, order)
-            if is_new or not reply:  # don't repeat the confirmation every turn
-                if is_new:
-                    print(f"New order #{order_id}: {record}")
-                reply = (reply + "\n\n" + order_confirmation(order_id, record)).strip()
-    else:
-        if had_tag:
-            # The model jumped ahead before the customer confirmed: don't save.
-            print("Ignored [ORDER] line before customer confirmation:", order)
-        if not reply and record and not error:
-            # Model's summary was empty or had wrong math: show the backend's.
-            reply = order_summary(record, language)
+            # Show the backend's summary; the order is saved only after the
+            # customer confirms this exact summary.
+            set_pending_order(session_id, order)
+            reply = (reply + "\n\n" + order_summary(record, language)).strip()
 
     if not reply:
         reply = unsure_message()
@@ -848,14 +1092,15 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def receive_message():
     """Meta calls this every time a customer messages the Page."""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
 
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
-            sender_id = event["sender"]["id"]
+            sender_id = event.get("sender", {}).get("id")
             message = event.get("message", {})
 
-            if "text" in message:
+            # is_echo = the Page's own reply coming back; answering it would loop.
+            if sender_id and "text" in message and not message.get("is_echo"):
                 try:
                     answer = handle_message(f"messenger:{sender_id}", message["text"])
                 except Exception as e:

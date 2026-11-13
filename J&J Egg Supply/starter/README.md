@@ -53,39 +53,84 @@ which updates without a restart.
   delivery, payment, and store info, so the bot only uses current facts.
 - Chat history and orders are saved in SQLite (`jj_egg.db`). Only the last
   10 messages of a conversation are sent to the model.
-- When a customer confirms an order, the model writes a hidden `[ORDER] {...}`
-  line. The backend removes it, re-checks size, stock, delivery rules, and
-  payment, recalculates the total from its own prices (never the model's
-  math), saves it to the `orders` table, and shows the customer the
-  confirmed total.
-- To see orders: `sqlite3 jj_egg.db "SELECT * FROM orders ORDER BY id DESC;"`
+- One order can have several products (e.g. eggs and rice). When the model
+  has all the order details it writes a hidden `[ORDER] {...}` line. The
+  backend removes it, re-checks products, stock, delivery rules, and payment,
+  calculates the total from its own prices (never the model's math), and
+  shows the customer the order summary. The order is saved only when the
+  customer replies "yes"/"opo" to that exact summary.
+- A saved order has status `pending`: the customer is told it is waiting for
+  staff confirmation and that staff will contact them. After staff confirm
+  with the customer, mark it, e.g.
+  `sqlite3 jj_egg.db "UPDATE orders SET status = 'confirmed' WHERE id = 12;"`
+- Delivery rules: free within Angeles City (eggs and rice). Outside Angeles
+  City: ₱5 per tray of eggs, 6 trays minimum; rice outside Angeles City is
+  referred to staff.
+- Orders are saved in the `orders` table (one row per order, with an
+  `items_summary`) and `order_items` (one row per product). To see them:
+  `sqlite3 jj_egg.db "SELECT id, created_at, customer_name, contact, items_summary, total, fulfillment FROM orders ORDER BY id DESC;"`
   (or open the file with DB Browser for SQLite).
-- `kb/promotions.json` is not shown to the bot: discounts, bulk orders (12+
-  trays), price negotiation, and complaints are always referred to staff.
+- Discount: ₱50 off the whole order for 12 or more trays of eggs (all sizes
+  combined). The rule lives in `kb/promotions.json` (`min_egg_trays`,
+  `discount`); the backend applies it to the total. Other discounts, price
+  negotiation, and complaints are referred to staff.
+- Orders are limited only by the stock in the sheet (no bulk limit).
 
-## Updating egg prices (Google Sheet)
+## Products, prices, and stock (Google Sheet)
 
-Prices change often, so they can be managed in a Google Sheet instead of
-editing code or JSON. The bot re-reads the sheet at most once a minute.
+The Google Sheet is the only place products, prices, and stock are kept.
+To add a product, add a row; no code change or restart is needed. Use
+`per tray ...` or `per sack` in the `unit` column: products with "sack" in the
+unit are counted in sacks, everything else in trays. The bot re-reads the
+sheet at most once a minute.
 
 One-time setup:
 
 1. Create a Google Sheet with this header row (first row):
-   `product | price | unit | size_range | last_updated`
-2. Add one row per egg size, e.g.
-   `Medium Eggs (M) | 238 | per tray of 30 pcs | 55-59 grams | 2026-11-05`
-   (price can be `238`, `238.00` or `₱238`).
+   `product | price | unit | size_range | last_updated | stock`
+2. Add one row per product, e.g.
+   `Medium Eggs (M) | 238 | per tray of 30 pcs | 55-59 grams | 2026-11-05 | 20`
+   `Jasmine Denorado Rice | 1200 | per sack | 25 kg | 2026-11-13 | 8`
+   (price can be `238`, `238.00`, `₱238` or `₱1,200`).
+   `stock` is trays for eggs and sacks for rice: `0` = out of stock, an empty
+   cell = not counted (the bot says staff will confirm availability).
 3. File -> Share -> **Publish to web** -> pick that sheet -> **Comma-separated
    values (.csv)** -> Publish, and copy the link.
 4. Put the link in `.env` (and in your host's environment variables):
    `PRICING_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/e/.../pub?output=csv`
 5. Restart the app once.
 
-After that, just edit the price in the sheet. The bot picks it up within about
-5-6 minutes (mostly Google's publish delay, plus up to 1 minute of the bot's
-cache), with no restart and
-no git. If the sheet can't be reached, the bot falls back to `kb/pricing.json`,
-so update that file once in a while too.
+After that, just edit prices or stock in the sheet. The bot picks it up within
+about 5-6 minutes (mostly Google's publish delay, plus up to 1 minute of the
+bot's cache), with no restart and no git.
+
+If the sheet can't be reached, the bot keeps using the last copy it loaded.
+If it can't load the sheet at all (e.g. no internet when the app starts), it
+tells customers prices are unavailable and gives the staff number.
+
+## Automatic stock updates (optional)
+
+With this set up, confirmed orders subtract from the sheet's `stock` column
+(e.g. 2 trays ordered: 20 -> 18), and the bot reads the sheet live, so price
+and stock edits show up within a minute instead of 5.
+
+1. Open the Google Sheet -> **Extensions -> Apps Script**. Delete what's there
+   and paste the contents of `sheet_script.gs`.
+2. In the script, change `SECRET` to a long random string. Save.
+3. **Deploy -> New deployment** -> gear icon -> **Web app**.
+   Execute as: **Me**. Who has access: **Anyone**. Deploy, allow the
+   permissions, and copy the **Web app URL**.
+4. In `.env`:
+   `SHEET_SCRIPT_URL=<the Web app URL>`
+   `SHEET_SCRIPT_SECRET=<the same secret as in the script>`
+5. Restart the app.
+
+Only the first tab of the sheet is read. The read link is public (like the
+published CSV), but stock can only be changed with the secret. If you edit
+the script later, use **Deploy -> Manage deployments -> Edit -> New version**
+so the URL stays the same. If the script can't be reached when an order is
+confirmed, the order is still saved and the server log says to update the
+stock by hand.
 
 ## Before you run this
 
