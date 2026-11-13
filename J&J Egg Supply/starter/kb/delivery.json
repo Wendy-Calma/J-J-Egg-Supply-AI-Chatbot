@@ -1,13 +1,14 @@
 [
   {
     "coverage": "Within Angeles City",
-    "fee": "Free delivery",
-    "last_updated": "2026-09-09"
+    "fee": "Free delivery (eggs and rice)",
+    "last_updated": "2026-11-13"
   },
   {
     "coverage": "Outside Angeles City",
-    "fee": "Additional \u20b15.00 per tray",
-    "minimum_order": "6 trays minimum required for delivery outside Angeles City",
-    "last_updated": "2026-09-09"
+    "fee": "Additional ₱5.00 per tray of eggs",
+    "minimum_order": "6 trays of eggs minimum required for delivery outside Angeles City",
+    "rice": "Rice is not delivered outside Angeles City through chat orders. Our staff arranges it, so give the customer the staff contact number.",
+    "last_updated": "2026-11-13"
   }
 ]

@@ -1,5 +1,0 @@
-[
-  { "product": "Small Eggs (S)", "stock_trays": 10, "note": "Stock changes daily -- keep this file updated frequently, or tell customers this is the last-known count.", "last_updated": "2026-09-09" },
-  { "product": "Medium Eggs (M)", "stock_trays": 20, "note": "Stock changes daily -- keep this file updated frequently, or tell customers this is the last-known count.", "last_updated": "2026-09-09" },
-  { "product": "Large Eggs (L)", "stock_trays": 20, "note": "Stock changes daily -- keep this file updated frequently, or tell customers this is the last-known count.", "last_updated": "2026-09-09" }
-]

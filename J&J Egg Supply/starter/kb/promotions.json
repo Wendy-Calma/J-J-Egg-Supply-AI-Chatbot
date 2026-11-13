@@ -1,7 +1,9 @@
 [
   {
-    "promo": "Bulk order discount",
-    "details": "Buy 12 trays and get a \u20b150.00 discount.",
-    "last_updated": "2026-09-09"
+    "promo": "Bulk egg discount",
+    "details": "₱50.00 off the whole order when you order 12 or more trays of eggs (any sizes combined).",
+    "min_egg_trays": 12,
+    "discount": 50,
+    "last_updated": "2026-11-14"
   }
 ]
