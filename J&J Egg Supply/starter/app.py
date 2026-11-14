@@ -21,6 +21,7 @@ import glob
 import time
 import uuid
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 
 import requests
@@ -70,6 +71,8 @@ BUSY_ERRORS = (openai.APITimeoutError, openai.APIConnectionError,
                openai.RateLimitError, openai.InternalServerError)
 
 DB_PATH = os.environ.get("DB_PATH", "jj_egg.db")
+# Postgres connection string (Render). When set, it's used instead of DB_PATH.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 HISTORY_LIMIT = 10        # messages of history sent to the model
 MAX_MESSAGE_CHARS = 1000  # longer customer messages are cut (protects the Gemini quota)
 
@@ -245,16 +248,132 @@ def unsure_message():
 
 
 # ---------------------------------------------------------------------------
-# Database: chat history + orders (SQLite, one file, no server needed)
+# Database: chat history + orders
+#   - DATABASE_URL set (Render Postgres): Postgres. Render's free web
+#     services erase local files on every redeploy, so SQLite there loses data.
+#   - otherwise: SQLite file DB_PATH (local testing, no setup needed)
+# Queries are written once with "?" placeholders; Db.execute adapts them.
 # ---------------------------------------------------------------------------
 
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+
+    # Reusing connections avoids a new database login on every query.
+    # prepare_threshold=None keeps it working behind connection poolers.
+    PG_POOL = ConnectionPool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        max_idle=120,
+        check=ConnectionPool.check_connection,
+        kwargs={"row_factory": dict_row, "prepare_threshold": None},
+        open=True,
+    )
+
+
+class Db:
+    """Thin wrapper so the same SQL runs on SQLite and Postgres."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=()):
+        if USE_POSTGRES:
+            sql = sql.replace("?", "%s")
+        return self.conn.execute(sql, params)
+
+    def insert(self, sql, params=()):
+        """Runs an INSERT and returns the new row's id."""
+        if USE_POSTGRES:
+            return self.execute(sql + " RETURNING id", params).fetchone()["id"]
+        return self.execute(sql, params).lastrowid
+
+
+@contextmanager
 def db():
+    """Commits when the block finishes, rolls back if it raises."""
+    if USE_POSTGRES:
+        with PG_POOL.connection() as conn:
+            yield Db(conn)
+        return
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield Db(conn)
+    finally:
+        conn.close()
+
+
+SCHEMA = """
+    CREATE TABLE IF NOT EXISTS messages (
+        id {id},
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+    CREATE TABLE IF NOT EXISTS orders (
+        id {id},
+        session_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        items_summary TEXT NOT NULL,
+        fulfillment TEXT NOT NULL,
+        delivery_area TEXT,
+        delivery_fee {real} NOT NULL,
+        discount {real} NOT NULL DEFAULT 0,
+        total {real} NOT NULL,
+        customer_name TEXT NOT NULL,
+        contact TEXT NOT NULL,
+        address TEXT,
+        payment_method TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new',
+        raw_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pending_orders (
+        session_id TEXT PRIMARY KEY,
+        raw_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS order_items (
+        id {id},
+        order_id {ref} NOT NULL REFERENCES orders(id),
+        product TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit TEXT NOT NULL,
+        unit_price {real} NOT NULL,
+        line_total {real} NOT NULL
+    );
+"""
+
+
+def create_tables(conn):
+    if USE_POSTGRES:
+        # Postgres REAL is only ~6 digits precise, so money uses DOUBLE PRECISION.
+        sql = SCHEMA.format(id="BIGSERIAL PRIMARY KEY", ref="BIGINT", real="DOUBLE PRECISION")
+    else:
+        sql = SCHEMA.format(id="INTEGER PRIMARY KEY AUTOINCREMENT", ref="INTEGER", real="REAL")
+    for statement in sql.split(";"):
+        if statement.strip():
+            conn.execute(statement)
 
 
 def init_db():
+    print("Database:", "PostgreSQL (DATABASE_URL)" if USE_POSTGRES else f"SQLite ({DB_PATH})")
+    if USE_POSTGRES:
+        with db() as conn:
+            # Several gunicorn workers may start at once; only one creates tables.
+            conn.execute("SELECT pg_advisory_xact_lock(4242)")
+            create_tables(conn)
+        return
+
     with db() as conn:
         # Older databases had one product per order (product/trays columns).
         if "product" in [r[1] for r in conn.execute("PRAGMA table_info(orders)")]:
@@ -263,50 +382,7 @@ def init_db():
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders_old'"
         ).fetchone() is not None
 
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                items_summary TEXT NOT NULL,
-                fulfillment TEXT NOT NULL,
-                delivery_area TEXT,
-                delivery_fee REAL NOT NULL,
-                discount REAL NOT NULL DEFAULT 0,
-                total REAL NOT NULL,
-                customer_name TEXT NOT NULL,
-                contact TEXT NOT NULL,
-                address TEXT,
-                payment_method TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'new',
-                raw_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS pending_orders (
-                session_id TEXT PRIMARY KEY,
-                raw_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS order_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL REFERENCES orders(id),
-                product TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                unit TEXT NOT NULL,
-                unit_price REAL NOT NULL,
-                line_total REAL NOT NULL
-            );
-        """)
+        create_tables(conn)
 
         if "discount" not in [r[1] for r in conn.execute("PRAGMA table_info(orders)")]:
             conn.execute("ALTER TABLE orders ADD COLUMN discount REAL NOT NULL DEFAULT 0")
@@ -340,11 +416,10 @@ def now_iso():
 
 def save_message(session_id, role, content):
     with db() as conn:
-        cur = conn.execute(
+        return conn.insert(
             "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
             (session_id, role, content, now_iso()),
         )
-        return cur.lastrowid
 
 
 def delete_message(message_id):
@@ -808,7 +883,9 @@ def recent_order_id(session_id, record):
 def set_pending_order(session_id, order):
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO pending_orders (session_id, raw_json, updated_at) VALUES (?, ?, ?)",
+            "INSERT INTO pending_orders (session_id, raw_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (session_id) DO UPDATE SET raw_json = excluded.raw_json, "
+            "updated_at = excluded.updated_at",
             (session_id, json.dumps(order, ensure_ascii=False), now_iso()),
         )
 
@@ -838,7 +915,7 @@ def save_order(session_id, record, raw_order):
     summary = describe_items(record["items"])
     with db() as conn:
         conn.execute("DELETE FROM pending_orders WHERE session_id = ?", (session_id,))
-        cur = conn.execute(
+        order_id = conn.insert(
             """INSERT INTO orders (session_id, created_at, items_summary, fulfillment,
                delivery_area, delivery_fee, discount, total, customer_name, contact, address,
                payment_method, raw_json, status)
@@ -848,13 +925,12 @@ def save_order(session_id, record, raw_order):
              record["contact"], record["address"], record["payment_method"],
              json.dumps(raw_order, ensure_ascii=False)),
         )
-        order_id = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO order_items (order_id, product, quantity, unit, unit_price, line_total) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [(order_id, i["product"], i["quantity"], i["unit"], i["unit_price"], i["line_total"])
-             for i in record["items"]],
-        )
+        for i in record["items"]:
+            conn.execute(
+                "INSERT INTO order_items (order_id, product, quantity, unit, unit_price, line_total) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (order_id, i["product"], i["quantity"], i["unit"], i["unit_price"], i["line_total"]),
+            )
         return order_id
 
 
