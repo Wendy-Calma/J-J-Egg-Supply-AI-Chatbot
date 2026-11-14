@@ -51,8 +51,14 @@ which updates without a restart.
   `/webhook` (Messenger) both call it.
 - The system prompt is rebuilt on every message from live prices, stock,
   delivery, payment, and store info, so the bot only uses current facts.
-- Chat history and orders are saved in SQLite (`jj_egg.db`). Only the last
-  10 messages of a conversation are sent to the model.
+- Chat history and orders are saved in Postgres when `DATABASE_URL` is set
+  (on Render: the database's Internal Database URL), otherwise in SQLite
+  (`jj_egg.db`, for local testing). The tables are created automatically on
+  startup, and the log shows `Database: PostgreSQL (DATABASE_URL)` or
+  `Database: SQLite (...)`. To browse the Render database, connect DBeaver
+  with the External Database URL details (SSL mode `require`). The SQL inside
+  the `sqlite3` commands below also works in DBeaver's SQL editor. Only the last 10 messages
+  of a conversation are sent to the model.
 - One order can have several products (e.g. eggs and rice). When the model
   has all the order details it writes a hidden `[ORDER] {...}` line. The
   backend removes it, re-checks products, stock, delivery rules, and payment,
